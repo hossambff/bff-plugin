@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# bff — BFF Brain helper.
+#   bff setup [--key FILE] [--operator ID] [--brain-dir DIR] [--no-schedule]   (runs automatically in the first session)
+#   bff session SESSION_ID [--operator ID] [--log yes|no] [--privileged]
+#   bff remember "fact" [--operator ID]
+#   bff whoami | status
+#   bff sync [--dry-run]            nightly: logged sessions → session notes, entity pages, memory
+#   bff ingest [--since DATE]       nightly (librarian): Notion Brain Inbox + Notion changes + Airtable → Brain
+#   bff tidy                        weekly (librarian): dedupe, contradictions, stale facts → firm/REVIEW.md
+#   bff eval                        weekly (librarian): answer evals/questions.json from the Brain, score it
+#   bff scan [--fix] [FILE...]      secret scan (default: whole Brain)
+#   bff schedule install|remove
+#   bff key new                     admin: make a new shared Brain key (when someone leaves)
+set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BFF_HOME="${BFF_HOME:-$HOME/.bff}"
+CONFIG="$BFF_HOME/config.json"
+STATE_DIR="$BFF_HOME/state"
+LOG_FILE="$BFF_HOME/sync.log"
+PLIST_LABEL="com.bff.brain-sync"
+PLIST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+KEY="$BFF_HOME/brain_key"          # shared Brain key (GitHub deploy key), if this Mac uses one
+mkdir -p "$STATE_DIR"
+
+die() { echo "bff: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed"; }
+need jq
+
+cfg() { [ -f "$CONFIG" ] && jq -r --arg k "$1" '.[$k] // empty' "$CONFIG" || true; }
+brain_dir() { local b; b="$(cfg brain_dir)"; b="${b:-$BFF_HOME/brain}"; echo "${b/#\~/$HOME}"; }
+# The team list lives in the private Brain, not in this (public) plugin.
+team() { echo "$(brain_dir)/firm/team.json"; }
+valid_op() { jq -e --arg id "$1" '.operators[] | select(.id==$id)' "$(team)" >/dev/null 2>&1; }
+op_name() { jq -r --arg id "$1" '.operators[] | select(.id==$id) | .name' "$(team)" 2>/dev/null; }
+op_ids() { jq -r '.operators[].id' "$(team)" 2>/dev/null | tr '\n' ' '; }
+set_json() { # file jq-filter [jq args...]
+  local f="$1"; shift; local filter="$1"; shift
+  local tmp; tmp=$(mktemp)
+  jq "$@" "$filter" "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+# ---------------------------------------------------------------------------
+ssh_cmd() {
+  if [ -f "$KEY" ]; then echo "ssh -i \"$KEY\" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+  else echo "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"; fi
+}
+# The key file the admin sends (AirDrop lands it in Downloads).
+find_key() { ls -t "$HOME/Downloads"/bff-brain*.key "$HOME/Desktop"/bff-brain*.key 2>/dev/null | grep -v '\.pub$' | head -1; }
+install_key() { # path [move]
+  [ -f "$1" ] || die "key file not found: $1"
+  grep -q "PRIVATE KEY" "$1" || die "$1 isn't a BFF Brain key file"
+  mkdir -p "$BFF_HOME"
+  if [ "${2:-}" = move ]; then mv -f "$1" "$KEY"; else cp "$1" "$KEY"; fi
+  chmod 600 "$KEY"
+}
+# Clone without ever prompting (this runs inside Claude sessions).
+clone_brain() { # repo dir
+  rm -rf "$2"
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$(ssh_cmd)" git clone -q "$1" "$2" 2>/dev/null && return 0
+  rm -rf "$2"; return 1
+}
+# Remember who usually uses this Mac; the librarian's Mac also runs the Notion/Airtable ingest.
+set_machine_operator() { # id
+  local op="$1" logd lib=false b; b="$(brain_dir)"
+  logd=$(jq -r --arg id "$op" '.operators[] | select(.id==$id) | .log_default // "ask"' "$(team)")
+  [ "$op" = "$(jq -r '.librarian // empty' "$(team)")" ] && lib=true
+  set_json "$CONFIG" '.operator = $op | .log_default = $l | .librarian = $lib' --arg op "$op" --arg l "$logd" --argjson lib "$lib"
+  git -C "$b" config user.name "BFF Brain ($(op_name "$op"))"
+  git -C "$b" config user.email "bff-brain@noreply.invalid"
+  echo "✓ This Mac's usual operator: $(op_name "$op") ($op), logging default: $logd"
+  [ "$lib" = true ] && echo "✓ Librarian Mac: also runs the nightly Notion/Airtable import and the Sunday clean-up"
+  [ -z "${BFF_NO_SCHEDULE:-}" ] && cmd_schedule install
+  return 0
+}
+cmd_setup() {
+  local op="" repo="" bdir="" keyf=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --operator) op="$2"; shift 2;;
+      --key) keyf="$2"; shift 2;;
+      --repo) repo="$2"; shift 2;;
+      --brain-dir) bdir="$2"; shift 2;;
+      --no-schedule) export BFF_NO_SCHEDULE=1; shift;;
+      *) die "unknown option $1";;
+    esac
+  done
+  need git
+  mkdir -p "$BFF_HOME"; [ -f "$CONFIG" ] || echo '{"summary_model":"sonnet"}' > "$CONFIG"
+  [ -n "$bdir" ] && set_json "$CONFIG" '.brain_dir = $b' --arg b "${bdir/#\~/$HOME}"
+  printf '%s\n' "$ROOT" > "$BFF_HOME/plugin_root"
+  local b; b="$(brain_dir)"
+  # A key file in Downloads/Desktop is newer than the one installed (e.g. after a key change): use it.
+  if [ -n "$keyf" ]; then install_key "$keyf"
+  else local k; k="$(find_key)"; [ -n "$k" ] && install_key "$k" move && echo "✓ Brain key installed (moved to $KEY)"; fi
+  if [ ! -d "$b/.git" ]; then
+    repo="${repo:-$(jq -r '.brain_repo // empty' "$ROOT/brain.json")}"
+    if ! clone_brain "$repo" "$b"; then
+      if [ -f "$KEY" ]; then
+        die "GitHub refused this Mac's BFF Brain key. Ask your BFF admin for a fresh bff-brain.key file, AirDrop it here, and start a new session."
+      else
+        die "No BFF Brain key on this Mac yet. Ask your BFF admin for the bff-brain.key file (AirDrop is easiest: it lands in Downloads), then start a new session. Or run: bff setup --key /path/to/bff-brain.key"
+      fi
+    fi
+  fi
+  git -C "$b" config core.hooksPath .githooks            # block secrets at commit time
+  [ -f "$KEY" ] && git -C "$b" config core.sshCommand "$(ssh_cmd)"
+  echo "✓ BFF Brain downloaded: $b"
+  if [ -n "$op" ]; then
+    valid_op "$op" || die "unknown operator '$op' (expected one of: $(op_ids))"
+    set_machine_operator "$op"
+  else
+    echo "Team (operator ids):"; jq -r '.operators[] | "  \(.id): \(.name) — \(.role)"' "$(team)"
+  fi
+  return 0
+}
+cmd_key() {
+  case "${1:-}" in
+    new)
+      need ssh-keygen
+      local d="$BFF_HOME/share"; mkdir -p "$d"; rm -f "$d/bff-brain.key" "$d/bff-brain.key.pub"
+      ssh-keygen -q -t ed25519 -N "" -C "bff-brain shared key $(date +%F)" -f "$d/bff-brain.key" || die "ssh-keygen failed"
+      chmod 600 "$d/bff-brain.key"
+      echo "New shared key: $d/bff-brain.key  (send this file to each team member, e.g. by AirDrop)"
+      echo "Add the PUBLIC key below on GitHub → bff-brain repo → Settings → Deploy keys → Add deploy key,"
+      echo "tick 'Allow write access', and delete the old key there if you're replacing one."
+      echo; cat "$d/bff-brain.key.pub"
+      ;;
+    *) die "usage: bff key new";;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+cmd_session() {
+  local sid="${1:-}"; shift || true
+  [ -n "$sid" ] || die "usage: bff session SESSION_ID [--operator ID] [--log yes|no] [--privileged]"
+  local st="$STATE_DIR/$sid.json"
+  if [ ! -f "$st" ]; then
+    jq -n --arg sid "$sid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{session_id:$sid, transcript_path:"", started_at:$now, operator:null, log:null, privileged:false, synced_mtime:0}' > "$st"
+  fi
+  local op="" logv="" priv=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --operator) op="$2"; shift 2;;
+      --log) logv="$2"; shift 2;;
+      --privileged) priv=1; shift;;
+      *) die "unknown option $1";;
+    esac
+  done
+  # First session on this Mac: download the Brain (needs the shared key file, or GitHub access).
+  if [ ! -d "$(brain_dir)/.git" ]; then
+    echo "First BFF session on this Mac: setting up the BFF Brain…"
+    ( cmd_setup ) 2>&1 | sed 's/^/  /'
+    [ -d "$(brain_dir)/.git" ] || echo "  (This session's choices are saved and will sync once setup succeeds.)"
+    echo
+  fi
+  if [ -n "$op" ]; then
+    op=$(echo "$op" | tr '[:upper:]' '[:lower:]')
+    if [ -f "$(team)" ]; then valid_op "$op" || die "unknown operator '$op' (expected one of: $(op_ids))"; fi
+    set_json "$st" '.operator = $op' --arg op "$op"
+    if [ -f "$(team)" ] && [ -z "$(cfg operator)" ]; then set_machine_operator "$op"; echo; fi
+  fi
+  case "$logv" in
+    yes|true|on) set_json "$st" '.log = true';;
+    no|false|off) set_json "$st" '.log = false';;
+    "") ;;
+    *) die "--log must be yes or no";;
+  esac
+  [ "$priv" = 1 ] && set_json "$st" '.privileged = true | .log = false'
+
+
+  local cur_op cur_log cur_priv
+  cur_op=$(jq -r '.operator // empty' "$st")
+  cur_log=$(jq -r '.log' "$st")
+  cur_priv=$(jq -r '.privileged' "$st")
+  local status="off the record"
+  [ "$cur_log" = "true" ] && status="ON — summarised into long-term memory at tonight's sync"
+  [ "$cur_priv" = "true" ] && status="OFF — privileged, will never be synced"
+  echo "Operator: ${cur_op:-not set}$( [ -n "$cur_op" ] && echo " ($(op_name "$cur_op"))" )"
+  echo "Logging: $status"
+
+  if [ -n "$op" ]; then
+    local mem; mem="$(brain_dir)/people/$op/MEMORY.md"
+    if [ -f "$mem" ]; then
+      echo; echo "----- Long-term memory: $(op_name "$op") -----"; head -c 12000 "$mem"
+    else
+      echo "(No long-term memory found for $op yet — it will be created by the first synced session.)"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+cmd_remember() {
+  local fact="" op=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --operator) op="$2"; shift 2;;
+      *) fact="${fact:+$fact }$1"; shift;;
+    esac
+  done
+  [ -n "$fact" ] || die 'usage: bff remember "fact"'
+  op="${op:-$(cfg operator)}"
+  valid_op "$op" || die "no operator set — pass --operator ID"
+  local b; b="$(brain_dir)"; [ -d "$b" ] || die "Brain not set up — run: bff setup"
+  local mem="$b/people/$op/MEMORY.md"
+  mkdir -p "$(dirname "$mem")"
+  [ -f "$mem" ] || printf '# Long-term memory — %s\n\n' "$(op_name "$op")" > "$mem"
+  grep -q '^## Inbox' "$mem" || printf '\n## Inbox (added in-session; tidied at nightly sync)\n' >> "$mem"
+  printf -- '- %s — %s\n' "$(date +%Y-%m-%d)" "$fact" >> "$mem"
+  echo "✓ Remembered for $(op_name "$op"): $fact"
+  ( cd "$b" && git add -- "people/$op/MEMORY.md" && git commit -qm "memory($op): in-session note" \
+      && git pull -q --rebase --autostash && git push -q ) >/dev/null 2>&1 &
+}
+
+# ---------------------------------------------------------------------------
+cmd_whoami() {
+  local op; op="$(cfg operator)"
+  if [ -n "$op" ]; then echo "Machine operator: $(op_name "$op") ($op)"; else echo "No operator configured — run: bff setup"; fi
+  echo "Brain: $(brain_dir)"
+  echo "Logging default: $(cfg log_default)"
+}
+
+mtime_of() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+pending_sessions() { # prints state files that need syncing
+  local f
+  for f in "$STATE_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    [ "$(jq -r '.log' "$f")" = "true" ] || continue
+    [ "$(jq -r '.privileged' "$f")" = "true" ] && continue
+    local op tp; op=$(jq -r '.operator // empty' "$f"); tp=$(jq -r '.transcript_path // empty' "$f")
+    [ -n "$op" ] && [ -f "$tp" ] || continue
+    [ "$(mtime_of "$tp")" -gt "$(jq -r '.synced_mtime // 0' "$f")" ] || continue
+    echo "$f"
+  done
+}
+
+cmd_status() {
+  cmd_whoami
+  echo
+  local n=0 f
+  for f in $(pending_sessions); do
+    n=$((n+1))
+    echo "pending: $(jq -r '"\(.started_at[0:10])  \(.operator)  \(.session_id[0:8])  \(.cwd // "")"' "$f")"
+  done
+  echo "$n session(s) waiting for tonight's sync."
+  [ -f "$PLIST" ] && echo "Nightly sync: scheduled (23:30)" || echo "Nightly sync: NOT scheduled — run: bff schedule install"
+  [ -f "$LOG_FILE" ] && { echo; echo "Last sync log lines:"; tail -5 "$LOG_FILE"; }
+}
+
+# Render a Claude Code transcript (JSONL) as plain dialogue, minus tool noise.
+render_transcript() {
+  jq -r '
+    select((.type=="user" or .type=="assistant") and (.isMeta != true) and (.isSidechain != true))
+    | (.message.content
+        | if type=="string" then .
+          elif type=="array" then (map(select(.type=="text") | .text) | join("\n"))
+          else "" end) as $t
+    | select(($t | length) > 0)
+    | "\n### \(if .type=="user" then "OPERATOR" else "CLAUDE" end)\n\($t)"
+  ' "$1" 2>/dev/null \
+  | perl -0pe 's/<system-reminder>.*?<\/system-reminder>//gs; s/<(command-[a-z-]+|local-command-[a-z-]+)>.*?<\/\1>//gs' \
+  | tail -c 250000
+}
+
+# Fill {{KEY}} placeholders in a prompt file. Usage: render_prompt FILE KEY=VALUE...
+render_prompt() {
+  local file="$1"; shift
+  BFF_KV="$(printf '%s\n' "$@")" perl -0pe '
+    BEGIN { %v = map { /^([^=]+)=(.*)$/s ? ($1,$2) : () } split /\n(?=[A-Z_]+=)/, $ENV{BFF_KV}; }
+    s/\{\{([A-Z_]+)\}\}/exists $v{$1} ? $v{$1} : "{{$1}}"/ge' "$file"
+}
+
+model_name() { local m; m="$(cfg summary_model)"; echo "${m:-sonnet}"; }
+claude_bin() { local c; c="$(command -v claude || echo "$HOME/.local/bin/claude")"; [ -x "$c" ] || die "claude CLI not found"; echo "$c"; }
+
+# Redact secrets in changed files, then commit + push. Usage: commit_brain BRAIN "message"
+commit_brain() {
+  local b="$1" msg="$2" changed
+  ( cd "$b" || exit 1
+    changed=$(git status --porcelain -uall | awk '{print $NF}' | grep -E '\.md$' || true)
+    if [ -n "$changed" ]; then
+      echo "$changed" | tr '\n' '\0' | xargs -0 perl "$ROOT/scripts/scrub-former.pl" "$b/firm/team.json" | sed 's/^/  scrubbed former member: /'
+      echo "$changed" | tr '\n' '\0' | xargs -0 perl "$ROOT/scripts/secret-scan.pl" --fix | sed 's/^/  redacted: /'
+    fi
+    git add -A -- companies founders lps people firm evals 2>/dev/null
+    git diff --cached --quiet && exit 0
+    git -c core.hooksPath=/dev/null commit -qm "$msg" \
+      && git pull -q --rebase --autostash && git push -q
+  ) >> "$LOG_FILE" 2>&1 || echo "  push failed — commits kept locally, will push next run" >> "$LOG_FILE"
+}
+
+cmd_sync() {
+  local dry=0; [ "${1:-}" = "--dry-run" ] && dry=1
+  need git
+  local b; b="$(brain_dir)"; [ -d "$b/.git" ] || die "Brain not set up — run: bff setup"
+  local model; model="$(cfg summary_model)"; model="${model:-sonnet}"
+  local CLAUDE_BIN; CLAUDE_BIN="$(claude_bin)"
+  echo "[$(date '+%F %T')] sync start" >> "$LOG_FILE"
+  ( cd "$b" && git pull -q --rebase --autostash ) >> "$LOG_FILE" 2>&1
+
+  local f n=0 ops=""
+  for f in $(pending_sessions); do
+    local sid op name tp day note tmp mt prompt
+    sid=$(jq -r '.session_id' "$f"); op=$(jq -r '.operator' "$f"); name=$(op_name "$op")
+    tp=$(jq -r '.transcript_path' "$f"); day=$(jq -r '.started_at[0:10]' "$f")
+    note="people/$op/sessions/$day-${sid:0:8}.md"
+    mt=$(mtime_of "$tp")
+    tmp=$(mktemp); render_transcript "$tp" > "$tmp"
+    if [ "$(wc -c < "$tmp")" -lt 300 ]; then
+      echo "  skip $sid (empty)" >> "$LOG_FILE"; rm -f "$tmp"
+      [ "$dry" = 0 ] && set_json "$f" '.synced_mtime = ($m|tonumber)' --arg m "$mt"
+      continue
+    fi
+    if [ "$dry" = 1 ]; then echo "would sync: $op $day ${sid:0:8} → $note ($(wc -c < "$tmp") chars)"; rm -f "$tmp"; continue; fi
+    echo "  summarising $op $sid" >> "$LOG_FILE"
+    prompt=$(render_prompt "$ROOT/prompts/session.md" "OP=$op" "NAME=$name" "DATE=$day" "SID=$sid" "NOTE=$note")
+    if ( cd "$b" && BFF_SYNC=1 "$CLAUDE_BIN" -p "$prompt" \
+           --model "$model" --permission-mode acceptEdits \
+           --allowedTools "Read,Write,Edit,Glob,Grep" < "$tmp" ) >> "$LOG_FILE" 2>&1 \
+       && [ -f "$b/$note" ]; then
+      set_json "$f" '.synced_mtime = ($m|tonumber) | .last_synced = $now' --arg m "$mt" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      n=$((n+1)); case " $ops " in *" $op "*) ;; *) ops="$ops $op";; esac
+    else
+      echo "  FAILED $sid — will retry next sync" >> "$LOG_FILE"
+    fi
+    rm -f "$tmp"
+  done
+
+  if [ "$dry" = 0 ]; then
+    commit_brain "$b" "brain: nightly sync ($n session(s):$ops) $(date +%F)"
+    ( cd "$b" && git push -q ) >> "$LOG_FILE" 2>&1 || true   # flush anything left from a failed night
+  fi
+  echo "[$(date '+%F %T')] sync done: $n session(s)" >> "$LOG_FILE"
+  [ "$dry" = 0 ] && echo "Synced $n session(s). Log: $LOG_FILE"
+}
+
+# Tools the headless librarian may use: files + Notion + (if connected) Airtable.
+librarian_tools() {
+  local extra; extra="$(cfg airtable_tools)"; extra="${extra:-mcp__claude_ai_Airtable}"
+  echo "Read,Write,Edit,Glob,Grep,mcp__notion,$extra"
+}
+
+cmd_ingest() {
+  local since=""
+  [ "${1:-}" = "--since" ] && since="${2:-}"
+  need git
+  local b; b="$(brain_dir)"; [ -d "$b/.git" ] || die "Brain not set up — run: bff setup"
+  local stamp="$BFF_HOME/ingest_last"
+  [ -z "$since" ] && since="$(cat "$stamp" 2>/dev/null || date -u -v-1d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)"
+  local started; started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "[$(date '+%F %T')] ingest start (since $since)" >> "$LOG_FILE"
+  ( cd "$b" && git pull -q --rebase --autostash ) >> "$LOG_FILE" 2>&1
+  local prompt out
+  prompt=$(render_prompt "$ROOT/prompts/ingest.md" "TODAY=$(date +%F)" "SINCE=$since" "SOURCES=$(cat "$b/firm/sources.json")")
+  out=$( cd "$b" && BFF_SYNC=1 "$(claude_bin)" -p "$prompt" --model "$(model_name)" \
+           --permission-mode acceptEdits --allowedTools "$(librarian_tools)" 2>&1 )
+  local rc=$?
+  printf '%s\n' "$out" >> "$LOG_FILE"
+  if [ $rc -eq 0 ]; then
+    printf '%s\n' "$started" > "$stamp"
+    commit_brain "$b" "brain: nightly ingest $(date +%F) — $(printf '%s' "$out" | grep -E '^ingest:' | tail -1)"
+    printf '%s\n' "$out" | grep -E '^ingest:' | tail -1
+  else
+    echo "  ingest FAILED (rc=$rc) — will retry from $since next run" >> "$LOG_FILE"; echo "ingest failed — see $LOG_FILE"
+  fi
+}
+
+cmd_tidy() {
+  local b; b="$(brain_dir)"; [ -d "$b/.git" ] || die "Brain not set up — run: bff setup"
+  echo "[$(date '+%F %T')] tidy start" >> "$LOG_FILE"
+  ( cd "$b" && git pull -q --rebase --autostash ) >> "$LOG_FILE" 2>&1
+  local out
+  out=$( cd "$b" && BFF_SYNC=1 "$(claude_bin)" -p "$(render_prompt "$ROOT/prompts/tidy.md" "TODAY=$(date +%F)")" \
+           --model "$(model_name)" --permission-mode acceptEdits \
+           --allowedTools "Read,Write,Edit,Glob,Grep" 2>&1 )
+  printf '%s\n' "$out" >> "$LOG_FILE"
+  commit_brain "$b" "brain: weekly tidy $(date +%F)"
+  printf '%s\n' "$out" | grep -E '^tidy:' | tail -1
+}
+
+# Each eval asks a fresh headless Claude a question it must answer from the Brain only,
+# then checks the answer contains every expected string (case-insensitive).
+cmd_eval() {
+  local b; b="$(brain_dir)"; [ -f "$b/evals/questions.json" ] || die "no evals/questions.json in the Brain"
+  local day; day=$(date +%F); local report="$b/evals/results/$day.md"
+  mkdir -p "$b/evals/results"
+  local n passed=0 total=0 i q ans ok
+  n=$(jq 'length' "$b/evals/questions.json")
+  printf '# Brain eval — %s\n\n| # | Question | Result | Missing |\n|---|---|---|---|\n' "$day" > "$report"
+  for i in $(seq 0 $((n-1))); do
+    q=$(jq -r ".[$i].q" "$b/evals/questions.json")
+    ans=$( cd "$b" && BFF_SYNC=1 "$(claude_bin)" -p "Answer using ONLY the files in this BFF Brain repository (search with Grep/Glob, read pages). Be brief: one or two sentences. If the Brain doesn't say, answer 'not in the Brain'. Question: $q" \
+             --model haiku --allowedTools "Read,Glob,Grep" 2>/dev/null )
+    ok=1; local missing=""
+    while IFS= read -r exp; do
+      [ -z "$exp" ] && continue
+      printf '%s' "$ans" | grep -qiF -- "$exp" || { ok=0; missing="$missing $exp;"; }
+    done < <(jq -r ".[$i].expect[]" "$b/evals/questions.json")
+    [ $ok = 0 ] && missing="$missing answer: $(printf '%s' "$ans" | tr '\n|' '  ' | cut -c1-200)"
+    total=$((total+1)); [ $ok = 1 ] && passed=$((passed+1))
+    printf '| %s | %s | %s | %s |\n' "$((i+1))" "$q" "$([ $ok = 1 ] && echo pass || echo FAIL)" "$missing" >> "$report"
+  done
+  printf '\n**Score: %s/%s**\n' "$passed" "$total" >> "$report"
+  echo "[$(date '+%F %T')] eval $passed/$total" >> "$LOG_FILE"
+  commit_brain "$b" "brain: eval $day ($passed/$total)"
+  echo "eval: $passed/$total passed — $report"
+}
+
+cmd_scan() {
+  local fix=""; [ "${1:-}" = "--fix" ] && { fix="--fix"; shift; }
+  if [ $# -eq 0 ]; then
+    local b; b="$(brain_dir)"
+    find "$b" -path "$b/.git" -prune -o -name '*.md' -print0 | xargs -0 perl "$ROOT/scripts/secret-scan.pl" $fix
+  else
+    perl "$ROOT/scripts/secret-scan.pl" $fix "$@"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+write_plist() { # label hour minute weekday(or "") command
+  local label="$1" hour="$2" min="$3" wday="$4" cmd="$5" plist="$HOME/Library/LaunchAgents/$1.plist" wd=""
+  [ -n "$wday" ] && wd="<key>Weekday</key><integer>$wday</integer>"
+  cat > "$plist" <<EOP
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$BFF_HOME/bin/bff-run</string><string>$cmd</string></array>
+  <key>StartCalendarInterval</key><dict>$wd<key>Hour</key><integer>$hour</integer><key>Minute</key><integer>$min</integer></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>StandardOutPath</key><string>$BFF_HOME/sync.log</string>
+  <key>StandardErrorPath</key><string>$BFF_HOME/sync.log</string>
+</dict></plist>
+EOP
+  launchctl unload "$plist" >/dev/null 2>&1 || true
+  launchctl load "$plist"
+}
+
+cmd_schedule() {
+  case "${1:-install}" in
+    install)
+      [ "$(uname)" = "Darwin" ] || die "scheduling is macOS-only for now; run 'bff sync' (and 'bff ingest' on the librarian) from cron instead"
+      mkdir -p "$HOME/Library/LaunchAgents" "$BFF_HOME/bin"
+      # Wrapper so plugin updates (new install path) don't break the schedule.
+      cat > "$BFF_HOME/bin/bff-run" <<'EOS'
+#!/usr/bin/env bash
+ROOT="$(cat "$HOME/.bff/plugin_root" 2>/dev/null)"
+[ -x "$ROOT/bin/bff" ] || { echo "plugin root not found" >> "$HOME/.bff/sync.log"; exit 1; }
+if [ "$1" = weekly ]; then "$ROOT/bin/bff" tidy; exec "$ROOT/bin/bff" eval; fi
+exec "$ROOT/bin/bff" "$@"
+EOS
+      chmod +x "$BFF_HOME/bin/bff-run"
+      rm -f "$BFF_HOME/bin/bff-nightly"
+      write_plist "$PLIST_LABEL" 23 30 "" sync && echo "✓ Nightly session sync: 23:30 (runs on wake if the Mac was asleep)"
+      if [ "$(cfg librarian)" = "true" ]; then
+        write_plist "com.bff.brain-ingest" 23 50 "" ingest && echo "✓ Nightly Notion/Airtable ingest: 23:50"
+        write_plist "com.bff.brain-weekly" 7 0 0 weekly && echo "✓ Weekly tidy + eval: Sundays 07:00"
+      fi
+      ;;
+    remove)
+      local l
+      for l in "$PLIST_LABEL" com.bff.brain-ingest com.bff.brain-weekly; do
+        launchctl unload "$HOME/Library/LaunchAgents/$l.plist" >/dev/null 2>&1 || true
+        rm -f "$HOME/Library/LaunchAgents/$l.plist"
+      done
+      echo "✓ BFF Brain schedules removed"
+      ;;
+    *) die "usage: bff schedule install|remove";;
+  esac
+}
+
+case "${1:-}" in
+  setup) shift; cmd_setup "$@";;
+  session) shift; cmd_session "$@";;
+  remember) shift; cmd_remember "$@";;
+  whoami) cmd_whoami;;
+  status) cmd_status;;
+  sync) shift; cmd_sync "$@";;
+  ingest) shift; cmd_ingest "$@";;
+  tidy) cmd_tidy;;
+  eval) cmd_eval;;
+  scan) shift; cmd_scan "$@";;
+  schedule) shift; cmd_schedule "$@";;
+  key) shift; cmd_key "$@";;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//';;
+esac

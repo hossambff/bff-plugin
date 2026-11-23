@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "bff",
+  "description": "Blockchain Founders Fund internal Claude plugins",
+  "owner": {
+    "name": "Blockchain Founders Fund"
+  },
+  "plugins": [
+    {
+      "name": "bff",
+      "description": "BFF team setup: operator check-in, personal + firm long-term memory (BFF Brain), nightly session logging, house style and connectors.",
+      "source": "./plugins/bff",
+      "category": "productivity"
+    }
+  ]
+}

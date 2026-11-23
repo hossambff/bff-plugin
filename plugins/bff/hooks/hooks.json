@@ -1,0 +1,25 @@
+{
+  "description": "BFF Brain: operator check-in and memory loading at session start; marks session end for the nightly sync.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

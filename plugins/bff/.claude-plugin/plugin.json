@@ -1,0 +1,9 @@
+{
+  "name": "bff",
+  "version": "0.1.0",
+  "description": "BFF team setup: operator check-in, personal + firm long-term memory (BFF Brain), nightly session logging, house style and connectors.",
+  "author": {
+    "name": "Blockchain Founders Fund"
+  },
+  "skills": "./skills/"
+}
